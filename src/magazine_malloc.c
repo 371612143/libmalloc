@@ -63,6 +63,7 @@
 #include <machine/cpu_capabilities.h>
 #include "extra_const_define.h"
 #define _COMM_PAGE_VERSION_REQD 9
+
 #undef __APPLE_API_PRIVATE
 #else
 #include <sys/sysctl.h>
@@ -3408,6 +3409,7 @@ tiny_malloc_should_clear(szone_t *szone, msize_t msize, boolean_t cleared_reques
 #endif /* TINY_CACHE */
 
 	while (1) {
+		//从释放的空闲列表查找
 		ptr = tiny_malloc_from_free_list(szone, tiny_mag_ptr, mag_index, msize);
 		if (ptr) {
 			SZONE_MAGAZINE_PTR_UNLOCK(szone, tiny_mag_ptr);
@@ -6235,9 +6237,9 @@ szone_malloc_should_clear(szone_t *szone, size_t size, boolean_t cleared_request
 	void	*ptr;
 	msize_t	msize;
 
-	if (size <= (NUM_TINY_SLOTS - 1)*TINY_QUANTUM) {
+	if (size <= (NUM_TINY_SLOTS - 1)*TINY_QUANTUM) {  //63*16
 		// think tiny
-		msize = TINY_MSIZE_FOR_BYTES(size + TINY_QUANTUM - 1);
+		msize = TINY_MSIZE_FOR_BYTES(size + TINY_QUANTUM - 1); //(size + 15) >> 4
 		if (!msize)
 			msize = 1;
 		ptr = tiny_malloc_should_clear(szone, msize, cleared_requested);
@@ -6255,10 +6257,6 @@ szone_malloc_should_clear(szone_t *szone, size_t size, boolean_t cleared_request
 		else
 			ptr = large_malloc(szone, num_kernel_pages, 0, cleared_requested);
 	}
-#if DEBUG_MALLOC
-	if (LOG(szone, ptr))
-		malloc_printf("szone_malloc returned %p\n", ptr);
-#endif
 	/*
 	 * If requested, scribble on allocated memory.
 	 */
@@ -7624,14 +7622,14 @@ create_scalable_zone(size_t initial_size, unsigned debug_flags)
 	 * upon the amount of memory in the system.  Switch to a larger number of
 	 * free list entries at 1GB.
 	 */
-#if defined(__i386__) || defined(__x86_64__) || defined(__arm__) || defined(__arm64__)
-	if ((hw_memsize = *(uint64_t *)(uintptr_t)_COMM_PAGE_MEMORY_SIZE) >= (1ULL << 30))
-#else
+//#if defined(__i386__) || defined(__x86_64__) || defined(__arm__) || defined(__arm64__)
+//	if ((hw_memsize = *(uint64_t *)(uintptr_t)_COMM_PAGE_MEMORY_SIZE) >= (1ULL << 30))
+//#else
 		size_t	uint64_t_size = sizeof(hw_memsize);
 
 	if (0 == sysctlbyname("hw.memsize", &hw_memsize, &uint64_t_size, 0, 0) &&
 		hw_memsize >= (1ULL << 30))
-#endif
+//#endif
 	{
 		szone->is_largemem = 1;
 		szone->num_small_slots = NUM_SMALL_SLOTS_LARGEMEM;
@@ -7695,7 +7693,7 @@ create_scalable_zone(size_t initial_size, unsigned debug_flags)
 
 	// Initialize the security token.
 	szone->cookie = (uintptr_t)malloc_entropy[0];
-
+	//初始scable_zone的分配函数表
 	szone->basic_zone.version = 8;
 	szone->basic_zone.size = (void *)szone_size;
 	szone->basic_zone.malloc = (void *)szone_malloc;
@@ -7732,11 +7730,11 @@ create_scalable_zone(size_t initial_size, unsigned debug_flags)
 	// Uniprocessor case gets just one tiny and one small magazine (whose index is zero). This gives
 	// the same behavior as the original scalable malloc. MP gets per-CPU magazines
 	// that scale (way) better.
-#if defined(__i386__) || defined(__x86_64__) || defined(__arm__) || defined(__arm64__)
-	int nproc = *(uint8_t *)(uintptr_t)_COMM_PAGE_NCPUS;
-#else
+//#if defined(__i386__) || defined(__x86_64__) || defined(__arm__) || defined(__arm64__)
+//	int nproc = *(uint8_t *)(uintptr_t)_COMM_PAGE_NCPUS;
+//#else
 	int nproc = sysconf(_SC_NPROCESSORS_CONF);
-#endif
+//#endif
 	szone->num_tiny_magazines = (nproc > 1) ? MIN(nproc, TINY_MAX_MAGAZINES) : 1;
 
 	// FIXME vm_allocate() based on number of configured CPUs

@@ -1052,6 +1052,7 @@ malloc_printf(const char *format, ...)
 void *
 malloc(size_t size) {
 	void	*retval;
+    //用默认的defaultzone 分配
 	retval = malloc_zone_malloc(inline_malloc_default_zone(), size);
 	if (retval == NULL) {
 		errno = ENOMEM;

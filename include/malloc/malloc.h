@@ -29,9 +29,11 @@
 #include <sys/cdefs.h>
 #include <Availability.h>
 
+///
 __BEGIN_DECLS
 /*********	Type definitions	************/
 
+//记录不同区域zone 的函数指针（MALLOC, FREE，size)
 typedef struct _malloc_zone_t {
     /* Only zone implementors should depend on the layout of this structure;
     Regular callers should use the access functions below */
@@ -179,6 +181,7 @@ local_memory: set to a contiguous chunk of memory; validity of local_memory is a
 typedef void vm_range_recorder_t(task_t, void *, unsigned type, vm_range_t *, unsigned);
     /* given a task and context, "records" the specified addresses */
 
+//内省 自我检查机制，提供数据检查，分析 打印等接口
 typedef struct malloc_introspection_t {
     kern_return_t (*enumerator)(task_t task, void *, unsigned type_mask, vm_address_t zone_address, memory_reader_t reader, vm_range_recorder_t recorder); /* enumerates all the malloc pointers in use */
     size_t	(*good_size)(malloc_zone_t *zone, size_t size);

@@ -146,6 +146,7 @@ boolean_t _malloc_engaged_nano;
 #define BAND_SIZE 		(1 << (NANO_SLOT_BITS + NANO_OFFSET_BITS)) /*  == Number of bytes covered by a page table entry */
 #define NANO_MAG_SIZE 		(1 << NANO_MAG_BITS)
 #define NANO_SLOT_SIZE 		(1 << NANO_SLOT_BITS)
+#import <cpu_capabilities.h>
 
 /****************************** zone itself ***********************************/
 
@@ -160,17 +161,17 @@ typedef struct chained_block_s {
 } *chained_block_t;
 
 typedef struct nano_meta_s {
-	OSQueueHead			slot_LIFO CACHE_ALIGN;
+	OSQueueHead			slot_LIFO CACHE_ALIGN; //用于重复利用释放内存的队列
     unsigned int		slot_madvised_log_page_count;
-	volatile uintptr_t		slot_current_base_addr;
-	volatile uintptr_t		slot_limit_addr;
-	volatile size_t		slot_objects_mapped;
-	volatile size_t		slot_objects_skipped;
+	volatile uintptr_t		slot_current_base_addr;  //slot页面基址
+	volatile uintptr_t		slot_limit_addr;	//当前slot地址上边界
+	volatile size_t		slot_objects_mapped;   //可已分配的对象个数
+	volatile size_t		slot_objects_skipped;	//slot开始的时候会跳过多少个object开始使用
 	bitarray_t			slot_madvised_pages;
     volatile uintptr_t		slot_bump_addr CACHE_ALIGN; // position on cache line distinct from that of slot_LIFO
-    volatile boolean_t		slot_exhausted;
-	unsigned int		slot_bytes;
-	unsigned int		slot_objects;
+    volatile boolean_t		slot_exhausted; //slot内存已经用尽
+	unsigned int		slot_bytes;  // 该slot中存储的bytes是多少(16、32、48...)
+	unsigned int		slot_objects; // 该slot中可以多少个object(slot总内存/slot_bytes)
 } *nano_meta_admin_t;
 
 typedef struct nanozone_s {				// vm_allocate()'d, so page-aligned to begin with.
@@ -179,7 +180,7 @@ typedef struct nanozone_s {				// vm_allocate()'d, so page-aligned to begin with
 
 	// remainder of structure is R/W (contains no function pointers)
 	// page-aligned
-	struct nano_meta_s		meta_data[NANO_MAG_SIZE][NANO_SLOT_SIZE]; // max: NANO_MAG_SIZE cores x NANO_SLOT_SIZE slots for nano blocks {16 .. 256}
+	struct nano_meta_s		meta_data[NANO_MAG_SIZE][NANO_SLOT_SIZE]; // max: NANO_MAG_SIZE cores x NANO_SLOT_SIZE slots for nano blocks {16 .. 256}每个cpu都有对应来的{16..256} 16个slot
 	_malloc_lock_s			band_resupply_lock[NANO_MAG_SIZE];
     uintptr_t           band_max_mapped_baseaddr[NANO_MAG_SIZE];
 	size_t			core_mapped_size[NANO_MAG_SIZE];
@@ -354,7 +355,8 @@ segregated_band_grow(nanozone_t *nanozone, nano_meta_admin_t pMeta, unsigned int
 	nano_blk_addr_t u; // the compiler holds this in a register
 	uintptr_t p, s;
 	size_t watermark, hiwater;
-
+	
+	//meta初始化
 	if (0 == pMeta->slot_current_base_addr) { // First encounter?
 
 		u.fields.nano_signature = NANOZONE_SIGNATURE;
@@ -365,9 +367,9 @@ segregated_band_grow(nanozone_t *nanozone, nano_meta_admin_t pMeta, unsigned int
 
 		p = u.addr;
 		pMeta->slot_bytes = slot_bytes;
-		pMeta->slot_objects = SLOT_IN_BAND_SIZE / slot_bytes;
+		pMeta->slot_objects = SLOT_IN_BAND_SIZE / slot_bytes;  //2^17 / slot_bytes
 	} else {
-		p = pMeta->slot_current_base_addr + BAND_SIZE; // Growing, so stride ahead by BAND_SIZE
+		p = pMeta->slot_current_base_addr + BAND_SIZE; // Growing, so stride ahead by BAND_SIZE = 2M
 
 		u.addr = (uint64_t)p;
 		if (0 == u.fields.nano_band) // Did the band index wrap?
@@ -436,13 +438,14 @@ segregated_next_block(nanozone_t *nanozone, nano_meta_admin_t pMeta, unsigned in
 {
 	while (1) {
 		uintptr_t theLimit = pMeta->slot_limit_addr; // Capture the slot limit that bounds slot_bump_addr right now
+		//将当前slot已分配的内存游标后移，分配一块新的内存
 		uintptr_t b = OSAtomicAdd64Barrier(slot_bytes, (volatile int64_t *)&(pMeta->slot_bump_addr));
 		b -= slot_bytes; // Atomic op returned addr of *next* free block. Subtract to get addr for *this* allocation.
-
-		if (b < theLimit) { // Did we stay within the bound of the present slot allocation?
-			return (void *)b; // Yep, so the slot_bump_addr this thread incremented is good to go
+		
+		if (b < theLimit) { // 新分配的内存地址没有超过当前slots的最大边界
+			return (void *)b; // 分配成功返回内存地址
 		} else {
-			if (pMeta->slot_exhausted) { // exhausted all the bands availble for this slot?
+			if (pMeta->slot_exhausted) { //内存用尽，向mach内核申请2M内存
 				return 0; // We're toast
 			} else {
 				// One thread will grow the heap, others will see its been grown and retry allocation
@@ -453,7 +456,9 @@ segregated_next_block(nanozone_t *nanozone, nano_meta_admin_t pMeta, unsigned in
 					return 0; // Toast
 				} else if (b < pMeta->slot_limit_addr) {
 					_malloc_lock_unlock(&nanozone->band_resupply_lock[mag_index]);
-					continue; // ... the slot was successfully grown by first-taker (not us). Now try again.
+					continue;
+					// ... the slot was successfully grown by first-taker (not us). Now try again.
+					//向操作系统申请内存，分配给对应的内存链表
 				} else if (segregated_band_grow(nanozone, pMeta, slot_bytes, mag_index)) {
 					_malloc_lock_unlock(&nanozone->band_resupply_lock[mag_index]);
 					continue; // ... the slot has been successfully grown by us. Now try again.
@@ -468,6 +473,7 @@ segregated_next_block(nanozone_t *nanozone, nano_meta_admin_t pMeta, unsigned in
 }
 
 static INLINE unsigned int
+
 segregated_size_to_fit(nanozone_t *nanozone, size_t size, unsigned int *pKey)
 {
 	unsigned int k, slot_bytes;
@@ -736,16 +742,19 @@ _nano_vet_and_size_of_free(nanozone_t *nanozone, const void *ptr)
         return 0;
 }
 
+//NONO-ZONE 的内存分配函数
 static void *
 _nano_malloc_check_clear(nanozone_t *nanozone, size_t size, boolean_t cleared_requested)
 {
 	void		*ptr;
 	unsigned int	slot_key;
-	unsigned int	slot_bytes = segregated_size_to_fit(nanozone, size, &slot_key); // Note slot_key is set here
+	//将malloc_size 转成对应的slot_size 16 32 ...256
+	unsigned int	slot_bytes = segregated_size_to_fit(nanozone, size, &slot_key);
+	//选择cpu以及对应的内存大小块
 	unsigned int	mag_index = NANO_MAG_INDEX(nanozone);
-
 	nano_meta_admin_t	pMeta = &(nanozone->meta_data[mag_index][slot_key]);
-
+	
+	//检测是否存在已经释放过，可以直接拿来用的内存
 	ptr = OSAtomicDequeue( &(pMeta->slot_LIFO), offsetof(struct chained_block_s,next));
 	if (ptr) {
 #if NANO_FREE_DEQUEUE_DILIGENCE
@@ -893,10 +902,9 @@ _nano_good_size(nanozone_t *nanozone, size_t size)
 	(((size + NANO_REGIME_QUANTA_SIZE - 1) >> SHIFT_NANO_QUANTUM) << SHIFT_NANO_QUANTUM);
 }
 
-static INLINE void _nano_free_trusted_size_check_scribble(nanozone_t *nanozone, void *ptr, size_t trusted_size, boolean_t do_scribble) ALWAYSINLINE;
+static void _nano_free_trusted_size_check_scribble(nanozone_t *nanozone, void *ptr, size_t trusted_size, boolean_t do_scribble);
 
-static INLINE void
-_nano_free_trusted_size_check_scribble(nanozone_t *nanozone, void *ptr, size_t trusted_size, boolean_t do_scribble)
+static void _nano_free_trusted_size_check_scribble(nanozone_t *nanozone, void *ptr, size_t trusted_size, boolean_t do_scribble)
 {
 	if (trusted_size) {
 		nano_blk_addr_t p; // happily, the compiler holds this in a register
@@ -1993,10 +2001,12 @@ create_nano_zone(size_t initial_size, malloc_zone_t *helper_zone, unsigned debug
 	
 	/* Query the number of configured processors. */
 #if defined(__x86_64__)
-	nanozone->phys_ncpus = *(uint8_t *)(uintptr_t)_COMM_PAGE_PHYSICAL_CPUS;
-	nanozone->logical_ncpus = *(uint8_t *)(uintptr_t)_COMM_PAGE_LOGICAL_CPUS;
+//	nanozone->phys_ncpus = *(uint8_t *)(uintptr_t)_COMM_PAGE_PHYSICAL_CPUS;
+//	nanozone->logical_ncpus = *(uint8_t *)(uintptr_t)_COMM_PAGE_LOGICAL_CPUS;
+	nanozone->phys_ncpus = 6;
+	nanozone->logical_ncpus = 6;
 #else
-#error Unknown architecture
+
 #endif
 	
 	if (nanozone->phys_ncpus > sizeof(nanozone->core_mapped_size)/sizeof(nanozone->core_mapped_size[0])) {
